@@ -1,0 +1,12 @@
+[package]
+name = "onebrc"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+debug = true
+
+
+[dependencies]
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+rayon = "1.10.0"
