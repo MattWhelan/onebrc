@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::env::args;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::thread;
+use rustc_hash::{FxBuildHasher, FxHashMap as HashMap};
 
 #[derive(Debug, Clone)]
 struct Record {
@@ -20,6 +20,17 @@ impl Default for Record {
             max: f32::MIN,
             sum: 0.0,
             count: 0,
+        }
+    }
+}
+
+impl From<f32> for Record {
+    fn from(value: f32) -> Self {
+        Record {
+            min: value,
+            max: value,
+            sum: value,
+            count: 1,
         }
     }
 }
@@ -50,10 +61,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let [_, filename, ..] = &args().collect::<Vec<_>>()[..] {
         let infile = File::open(filename)?;
 
-        let mut buf = BufReader::with_capacity(2 * 1024 * 1024, infile);
+        let buf = BufReader::with_capacity(2 * 1024 * 1024, infile);
 
-        let mut processor = Processor::new();
-        let result = processor.process(&mut buf)?;
+        let result = produce_table(buf);
         report(&result)
     } else {
         println!("Usage: onebrc <filename>");
@@ -61,101 +71,99 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-struct Processor {}
-
-impl Processor {
-    fn new() -> Self {
-        Self {}
+fn insert_or_update(table: &mut Table, k: &[u8], v: f32) {
+    if let Some(r) = table.get_mut(k) {
+        r.add(v);
+    } else {
+        let r = Record::from(v);
+        table.insert(Vec::from(k), r);
     }
+}
 
-    fn process(&mut self, buf: &mut BufReader<File>) -> Result<Table, Box<dyn Error>> {
-        let mut prefix = Vec::with_capacity(1024);
+fn produce_table(mut reader: BufReader<File>) -> Table {
+    let mut table = Table::with_capacity_and_hasher(10_000, FxBuildHasher);
 
-        let (chunk_tx, chunk_rx) = crossbeam::channel::bounded::<Vec<u8>>(20);
+    let mut stash = Vec::with_capacity(100);
 
-        let mut workers = Vec::new();
-        for _ in 0..12 {
-            let rx = chunk_rx.clone();
-            workers.push(thread::spawn(move || {
-                let mut result = Table::new();
-                rx.iter()
-                    .for_each(|chunk| {
-                        chunk.split(|b| *b == b'\n')
-                            .map(|bs| Self::process_line(bs))
-                            .for_each(|(k, v)| {
-                                let e = result.entry(k).or_default();
-                                e.add(v);
-                            })
-                    });
-
-                result
-            }));
+    while let Ok(mut buf) = reader.fill_buf() {
+        if buf.is_empty() {
+            break;
         }
+        let mut it = buf.iter().enumerate();
+        if let Some((sep, _)) = it.find(|(_, &b)| b == b';') {
+            if let Some((end, _)) = it.find(|(_, &b)| b == b'\n') {
+                let (name, rest) = buf.split_at(sep);
+                let (val, _) = rest[1..].split_at(end - sep - 1);
 
-        loop {
-            let bytes = buf.fill_buf().unwrap();
-            if bytes.is_empty() {
-                break;
-            }
+                let v = parse_decimal(val);
 
-            if let Some(pos) = bytes.iter().rposition(|b| *b == b'\n') {
-                let mut chunk = Vec::with_capacity(prefix.len() + pos);
-                chunk.extend_from_slice(&prefix);
-                chunk.extend_from_slice(&bytes[0..pos]);
-
-                chunk_tx.send(chunk)?;
-
-                prefix.clear();
-                prefix.extend_from_slice(&bytes[pos + 1..]);
+                //dbg!(String::from_utf8_lossy(name), v);
+                insert_or_update(&mut table, name, v);
+                reader.consume(end+1);
             } else {
-                dbg!("Big line!");
-                prefix.extend_from_slice(bytes);
+                // didn't get to the newline
+                stash.extend_from_slice(buf);
+                let consumed = buf.len();
+                reader.consume(consumed);
+                buf = reader.fill_buf().unwrap();
+                let mut it = buf.iter().enumerate();
+                if let Some((end, _)) = it.find(|(_, &b)| b == b'\n') {
+                    stash.extend_from_slice(&buf[..end]);
+                    let (name, rest) = stash.split_at(sep);
+                    let val = &rest[1..];
+                    let v = parse_decimal(val);
+
+                    // dbg!(String::from_utf8_lossy(name), v);
+                    insert_or_update(&mut table, name, v);
+                    reader.consume(end+1);
+                } else {
+                    panic!("Missing newline");
+                }
             }
-            let length = bytes.len();
-            buf.consume(length);
-        }
-        drop(chunk_tx);
-
-        let table = workers.into_iter().map(|w| w.join().unwrap())
-            .reduce(|mut l, r| {
-                Self::merge_maps(&mut l, r);
-                l
-            });
-
-        Ok(table.unwrap())
-    }
-
-    fn process_chunk(chunk: Vec<u8>) -> Table {
-        chunk.split(|b| *b == b'\n')
-            .map(|bs| Self::process_line(bs))
-            .fold(HashMap::new(), |mut acc, (k, v)| {
-                let e: &mut Record = acc.entry(k).or_default();
-                e.add(v);
-                acc
-            })
-    }
-
-    fn merge_maps(l: &mut Table, r: Table) {
-        r.into_iter().for_each(|(k, v)| {
-            let e = l.entry(k).or_default();
-            e.merge(&v);
-        });
-    }
-
-    fn process_line(bs: &[u8]) -> (Vec<u8>, f32) {
-        if let Some(pos) = bs.iter().rposition(|b| *b == b';') {
-            let name = &bs[0..pos];
-            let num = &bs[pos + 1..];
-
-            let v = parse_decimal(num);
-            // let float_str = std::str::from_utf8(num).expect("bad utf8");
-            // let v = f32::from_str(float_str).expect("expected float str");
-
-            (name.to_owned(), v)
         } else {
-            panic!("missing semicolon: {}", String::from_utf8_lossy(bs))
+            // didn't find the separator
+            stash.extend_from_slice(buf);
+            let consumed = buf.len();
+            reader.consume(consumed);
+            buf = reader.fill_buf().unwrap();
+            let mut it = buf.iter().enumerate();
+            if let Some((sep, _)) = it.find(|(_, &b)| b == b';') {
+                if let Some((end, _)) = it.find(|(_, &b)| b == b'\n') {
+                    let (name, rest) = buf.split_at(sep);
+                    stash.extend_from_slice(name);
+                    let (val, _) = rest[1..].split_at(end - sep - 1);
+
+                    let v = parse_decimal(val);
+
+                    // dbg!(String::from_utf8_lossy(name), v);
+                    insert_or_update(&mut table, &stash, v);
+                    reader.consume(end+1);
+                } else {
+                    // didn't get to the newline
+                    stash.extend_from_slice(buf);
+                    let consumed = buf.len();
+                    reader.consume(consumed);
+                    buf = reader.fill_buf().unwrap();
+                    let mut it = buf.iter().enumerate();
+                    if let Some((end, _)) = it.find(|(_, &b)| b == b'\n') {
+                        stash.extend_from_slice(&buf[..end]);
+                        let (name, rest) = stash.split_at(sep);
+                        let val = &rest[1..];
+                        let v = parse_decimal(val);
+
+                        // dbg!(String::from_utf8_lossy(name), v);
+                        insert_or_update(&mut table, name, v);
+                        reader.consume(end+1);
+                    } else {
+                        panic!("Missing newline");
+                    }
+                }
+            }
         }
+        stash.clear();
     }
+
+    table
 }
 
 fn parse_decimal(bs: &[u8]) -> f32 {
@@ -191,22 +199,6 @@ fn parse_decimal(bs: &[u8]) -> f32 {
     }
 }
 
-fn count_buffer(buf: &mut BufReader<File>) -> Result<(), Box<dyn Error>> {
-    let mut count = 0;
-    loop {
-        let bytes = buf.fill_buf()?;
-        let size = bytes.len();
-        if size > 0 {
-            count += size;
-            buf.consume(size);
-        } else {
-            break;
-        }
-    }
-
-    println!("Count {count}");
-    Ok(())
-}
 
 fn report(table: &Table) -> Result<(), Box<dyn Error>> {
     let mut stdout = std::io::stdout().lock();
@@ -218,7 +210,7 @@ fn report(table: &Table) -> Result<(), Box<dyn Error>> {
     })
         .collect();
     for (city, record) in table.into_iter() {
-        write!(stdout, "{city}={:.1}/{:.1}/{:.1}, ", record.min, record.mean(), record.max)?;
+        write!(stdout, "{city}={:.1}/{:.1}/{:.1}, \n", record.min, record.mean(), record.max)?;
     }
     writeln!(stdout, "}}")?;
     Ok(())

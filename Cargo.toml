@@ -10,3 +10,4 @@ debug = true
 [dependencies]
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 rayon = "1.10.0"
+rustc-hash = "2.0.0"
