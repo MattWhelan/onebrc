@@ -4,7 +4,6 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::sync::mpsc;
-use crossbeam::thread;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap};
 
 #[derive(Debug, Clone)]
@@ -99,8 +98,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let (tx, rx) = mpsc::channel::<Table>();
 
-        thread::scope(|s| {
-            s.spawn(move |_| {
+        std::thread::scope(|s| {
+            s.spawn(move || {
                 let final_table = rx.iter().reduce(|mut l, r| {
                     r.into_iter().for_each(|(k, r)| {
                         let e = l.entry(k).or_default();
@@ -116,14 +115,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             infiles.into_iter()
                 .for_each(|f| {
                     let tx = tx.clone();
-                    s.spawn(move |_| {
+                    s.spawn(move || {
                         let buf: BufReader<_> = BufReader::with_capacity(2 * 1024 * 1024, f);
                         let t = produce_table(buf);
                         tx.send(t).expect("Send error")
                     });
                 });
             drop(tx);
-        }).expect("Thread scope failed.");
+        });
 
         Ok(())
     } else {
