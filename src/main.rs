@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::env::args;
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::sync::mpsc;
+use crossbeam::thread;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap};
 
 #[derive(Debug, Clone)]
@@ -59,12 +61,71 @@ type Table = HashMap<Vec<u8>, Record>;
 
 fn main() -> Result<(), Box<dyn Error>> {
     if let [_, filename, ..] = &args().collect::<Vec<_>>()[..] {
-        let infile = File::open(filename)?;
+        let mut infile = File::open(filename)?;
 
-        let buf = BufReader::with_capacity(2 * 1024 * 1024, infile);
+        let file_len = infile.seek(SeekFrom::End(0))?;
+        let core_count: usize = std::thread::available_parallelism().unwrap().into();
+        let num_chunks = core_count as u64;
+        let splits: Vec<_> = (1..num_chunks).map(|i| i * (file_len/num_chunks))
+            .map(|pos| {
+                // seek forward to align with the start of a line
+                infile.seek(SeekFrom::Start(pos)).unwrap();
+                let mut b = [0u8; 1];
+                while b[0] != b'\n' {
+                    infile.read(&mut b[..]).unwrap();
+                }
+                infile.stream_position().unwrap()
+            })
+            .collect();
 
-        let result = produce_table(buf);
-        report(&result)
+        let mut infiles: Vec<_> = splits.windows(2)
+            .map(|splits| {
+                let split = splits[0];
+                let len = splits[1] - splits[0];
+                let mut f = File::open(filename).expect("reopen failed");
+                f.seek(SeekFrom::Start(split)).unwrap();
+                f.take(len)
+            })
+            .collect();
+        infile.seek(SeekFrom::Start(0)).unwrap();
+        infiles.insert(0, infile.take(splits[0]));
+
+        infiles.push({
+            let mut f = File::open(filename).expect("reopen failed");
+            f.seek(SeekFrom::Start(*splits.last().unwrap())).unwrap();
+            // For type consistency, this needs to be a Take instance, but the last one has no limit.
+            f.take(u64::MAX)
+        });
+
+        let (tx, rx) = mpsc::channel::<Table>();
+
+        thread::scope(|s| {
+            s.spawn(move |_| {
+                let final_table = rx.iter().reduce(|mut l, r| {
+                    r.into_iter().for_each(|(k, r)| {
+                        let e = l.entry(k).or_default();
+                        e.merge(&r);
+                    });
+                    l
+                })
+                    .unwrap();
+                report(&final_table).unwrap();
+            });
+
+
+            infiles.into_iter()
+                .for_each(|f| {
+                    let tx = tx.clone();
+                    s.spawn(move |_| {
+                        let buf: BufReader<_> = BufReader::with_capacity(2 * 1024 * 1024, f);
+                        let t = produce_table(buf);
+                        tx.send(t).expect("Send error")
+                    });
+                });
+            drop(tx);
+        }).expect("Thread scope failed.");
+
+        Ok(())
     } else {
         println!("Usage: onebrc <filename>");
         Ok(())
@@ -80,7 +141,7 @@ fn insert_or_update(table: &mut Table, k: &[u8], v: f32) {
     }
 }
 
-fn produce_table(mut reader: BufReader<File>) -> Table {
+fn produce_table<T: Read>(mut reader: BufReader<T>) -> Table {
     let mut table = Table::with_capacity_and_hasher(10_000, FxBuildHasher);
 
     let mut stash = Vec::with_capacity(100);
