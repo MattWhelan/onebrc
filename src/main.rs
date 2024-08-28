@@ -141,7 +141,7 @@ fn insert_or_update(table: &mut Table, k: &[u8], v: f32) {
 }
 
 fn produce_table<T: Read>(mut reader: BufReader<T>) -> Table {
-    let mut table = Table::with_capacity_and_hasher(10_000, FxBuildHasher);
+    let mut table = Table::with_capacity_and_hasher(1000, FxBuildHasher);
 
     let mut stash = Vec::with_capacity(100);
 
