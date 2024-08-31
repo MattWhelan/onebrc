@@ -1,0 +1,11 @@
+[package]
+name = "onebrc"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+debug = true
+
+
+[dependencies]
+rustc-hash = "2.0.0"

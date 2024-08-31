@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         splits.insert(0, 0);
         splits.push(u64::MAX);
 
-        let mut infiles: Vec<_> = splits.windows(2)
+        let infiles: Vec<_> = splits.windows(2)
             .map(|splits| {
                 let split = splits[0];
                 let len = splits[1] - splits[0];

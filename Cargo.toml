@@ -1,11 +1,8 @@
-[package]
-name = "onebrc"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
 
-[profile.release]
-debug = true
+members = [
+    "onebrc",
+    "gen"
+]
 
-
-[dependencies]
-rustc-hash = "2.0.0"
